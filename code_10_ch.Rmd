@@ -1,0 +1,493 @@
+---
+title: "thesis_2_10_ch"
+author: "Yuli Song"
+date: "05/08/2021"
+output: pdf_document
+---
+
+```{r setup, include=FALSE, warning=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+```{r, include=FALSE, warning=FALSE}
+# Load packages
+library(ggplot2)
+library(sp)
+library(rgdal)
+library(readxl)
+library(cowplot)
+library(moveHMM)
+library(dplyr)
+library(caret)
+# Package for parallel computations
+library(parallel)
+library(TSdist)
+```
+
+```{r, include=FALSE, warning=FALSE}
+# Define a function that can be used to check if a vector is sequential
+is.sequential <- function(x){
+    all(abs(diff(x)) == 1)
+}
+```
+
+```{r, include=FALSE, warning=FALSE}
+# Load dataset
+setwd("D:/thesis_2")
+coquet = readxl::read_xlsx("Coquet_2010_chickrearing_Tern_tracks.xlsx", 1) %>%
+        rename(ID = TRACKID)
+
+# Rank the records according to TSECS and ID
+coquet = coquet[with(coquet, order(ID, TSECS)),]
+
+# Check the tern ID
+table(coquet$ID)
+# Result shows that there are 20 tracks
+
+# Check the distance from the bird to the boat
+quantile(coquet$DISTKM)
+# Result shows that the distance between bird and boat is very short. Considering that the distance between the boat and the bird it is following varies throughout the track and observers may make mistakes when estimating distance between boat and bird, DISTKM is not used to calculate the accurate bird location. And the deviation is acceptable.
+
+
+# Check the time interval is correct
+time_spit = split(coquet$TSECS, f = coquet$ID)
+lapply(time_spit,is.sequential) 
+# Result shows that all track are continuous
+
+# Extract useful information from the dataset
+track = coquet %>% 
+        select(c(ID, LATITUDE, LONGITUDE, CONTBEH, SPECIES)) %>% 
+        as.data.frame()
+
+# Check the continuous behaviour and species of tern
+table(track$CONTBEH)
+table(track$SPECIES)
+# Result shows that main behaviours recorded are AS, DF and TS
+
+# Check NA inside the dataset
+sapply(track, function(x) sum(is.na(x)))
+# There's no missing data
+
+# Split the dataset by the tern species
+track_C = track %>%
+        filter(SPECIES=="Common")
+
+track_A = track %>%
+        filter(SPECIES=="Arctic")
+
+track_CA = track %>%
+        filter(SPECIES=="Common/Arctic")
+
+track_R = track %>%
+        filter(SPECIES=="Roseate")
+
+track_S = track %>%
+        filter(SPECIES=="Sandwich")
+
+# Split the dataset by the tern species
+track_x_C = track %>%
+        filter(SPECIES=="Common") %>% 
+        select(c(ID, LATITUDE, LONGITUDE))
+
+track_x_A = track %>%
+        filter(SPECIES=="Arctic") %>% 
+        select(c(ID, LATITUDE, LONGITUDE))
+
+track_x_CA = track %>%
+        filter(SPECIES=="Common/Arctic") %>% 
+        select(c(ID, LATITUDE, LONGITUDE))
+
+track_x_R = track %>%
+        filter(SPECIES=="Roseate") %>% 
+        select(c(ID, LATITUDE, LONGITUDE))
+
+track_x_S = track %>%
+        filter(SPECIES=="Sandwich") %>% 
+        select(c(ID, LATITUDE, LONGITUDE))
+
+```
+
+Draw the tern tracking plot
+```{r, include=FALSE, warning=FALSE}
+# Plot shapefile:
+uk<-readOGR("GBR_adm/GBR_adm1.shp") #install shapefile
+ukgrid <- "+init=epsg:27700" #specify coordinate system
+uk_ukgrid <- spTransform(uk, ukgrid) #transform shapefile to specified coordinate system
+
+p = ggplot() + 
+        geom_polygon(data = uk_ukgrid, aes(x = long, y = lat, group = group), size = 0.1, fill = "lightgrey") +
+        coord_cartesian(xlim = c(-100000, 800000),ylim = c(0, 1300000)) + 
+        geom_point(data=coquet, aes (x=BNGX,y=BNGY, colour=SPECIES), size=1, show.legend = FALSE) +
+        geom_rect(aes(
+        xmin = 400000,
+        ymin = 570000,
+        xmax = 500000,
+        ymax = 670000),
+        fill = NA, 
+        color = "black"
+        ) + 
+ theme(panel.border = element_rect(color = "black",
+                                    fill = NA,
+                                    size = 1),
+          panel.grid = element_blank(),
+          panel.background = element_blank(),
+          axis.text = element_blank(),
+          axis.ticks = element_blank(),
+          axis.title = element_blank()) + coord_fixed(1)
+
+#plot transformed shapefile using ggplot
+
+
+#modify plot by changing xlim and ylim of coordinates 
+inset = ggplot() +
+ geom_polygon(data = uk_ukgrid, aes(x = long, y = lat, group = group), fill="lightgrey") +
+ coord_cartesian(xlim = c(400000, 500000),ylim = c(570000, 670000)) + 
+ geom_point(data=coquet, aes (x=BNGX,y=BNGY, colour=SPECIES), size=1) + 
+        theme(panel.grid = element_blank(),
+          panel.background = element_blank(),
+          axis.text = element_blank(),
+          axis.ticks = element_blank(),
+          axis.title = element_blank())
+
+ggdraw(inset) +
+    draw_plot(p, .7, .6, .3, .3) +
+    draw_plot_label(
+        c("Tern GPS Points", "UK Map"),
+        c(0.2, 0.5),
+        c(0.9, 0.8),
+        size = 12
+    ) + theme(legend.position = "none")
+```
+
+Process data using prepData to compute step lengths and angles.
+```{r, include=FALSE, warning=FALSE}
+# Compute step lengths and angles
+process = function(track_x) {
+    process_track <- prepData(track_x, type="LL",
+                            coordNames=c("LATITUDE","LONGITUDE"))
+
+    # EDA of processed dataset
+    #### head(process_track)
+    #### summary(process_track)
+    
+    # Check NA in processed dataset
+    #### check_na_1 = process_track[is.na(process_track$ID) | is.na(process_track$step) | is.na(process_track$angle) | is.na(process_track$x) | is.na(process_track$y),]
+    #### View(check_na_1)
+    
+    #### check_na_2 = process_track[is.na(process_track$ID) | is.na(process_track$step) | is.na(process_track$x) | is.na(process_track$y),]
+    #### View(check_na_2)
+    # Combining the result and https://github.com/TheoMichelot/moveHMM/blob/master/R/prepData.R, it's easy to find that all NA in step column appears only in the first record of each track. However, from https://github.com/TheoMichelot/moveHMM/blob/master/R/turnAngle.R, it shows that the angle can be NA only when the location doesn't change
+    
+    # Replace NA with 0
+    process_track[is.na(process_track)]=0
+    return(process_track)
+}
+
+process_track_A = process(track_x_A)
+process_track_C = process(track_x_C)
+process_track_CA = process(track_x_CA)
+process_track_R = process(track_x_R)
+process_track_S = process(track_x_S)
+```
+
+Visualize the processed dataset
+```{r, include=FALSE, warning=FALSE}
+visual_processed = function(process_track, animals) {
+    plot(process_track, animals=animals, ask=F)
+    hist(process_track$step)
+    hist(process_track$angle, breaks = seq(-pi, pi, length = 15))
+    whichzero <- which(process_track$step == 0)
+    length(whichzero)/nrow(process_track)
+}
+
+visual_processed(process_track_A, animals=c(1))
+```
+Visualization here is very important as we need to use the result to select the initial parameter for HMM. It also tells us that there are steps of length zero in the data, an additional parameter would be needed for the step length distribution.
+
+Tune the initial parameters for two-state HMM without covariates and train multiple models
+```{r, include=FALSE, warning=FALSE}
+
+# Fit the niter models in parallel
+fit_model = function(process_track) {
+    
+    # https://cran.csiro.au/web/packages/moveHMM/vignettes/moveHMM-starting-values.pdf
+    # Create cluster of size ncores
+    ncores <- detectCores() - 1
+    cl <- makeCluster(getOption("cl.cores", ncores))
+    # Export objects needed in parallelised function to cluster
+    clusterExport(cl, list(deparse(substitute(process_track)), "fitHMM"), envir=environment())
+    
+    # Number of tries with different starting values
+    niter <- 10
+    
+    # Create list of starting values
+    allPar0 <- lapply(as.list(1:niter), function(x) {
+            # Step length mean
+            stepMean0 <- runif(2,
+                    min = c(0, 0.01),
+                    max = c(0.02, 0.04))
+            # Step length standard deviation
+            stepSD0 <- runif(2,
+                    min = c(0, 0.01),
+                    max = c(0.02, 0.04))
+            # Step length zero proportion
+            zeroMass0 <- runif(2,
+                    min = c(0, 0.005),
+                    max = c(0.02, 0.03))
+            # Turning angle mean
+            angleMean0 <- c(0, 0)
+            # Turning angle concentration
+            angleCon0 <- runif(2,
+                    min = c(0, 0.2),
+                    max = c(0.8, 5))
+            # Return vectors of starting values
+            stepPar0 <- c(stepMean0, stepSD0, zeroMass0)
+            anglePar0 <- c(angleMean0, angleCon0)
+            return(list(step = stepPar0, angle = anglePar0))
+    })
+    
+    allm_parallel <- parLapply(cl = cl, X = allPar0, fun = function(par0) {
+            m <- fitHMM(data = process_track, nbStates = 2, stepPar0 = par0$step,
+            anglePar0 = par0$angle)
+            return(m)
+    })
+    
+    # Index of best fitting model (smallest negative log-likelihood)
+    whichbest <- which.min(lapply(allm_parallel, function(x) x$mod$minimum))
+    # Best fitting model
+    mbest <- allm_parallel[[whichbest]]
+    return(mbest)
+}
+
+# We can apply try-catch combo here to avoid unconvergence and error
+fit_model_noerror = function(process_track) {
+    repeat {
+        tmp<-try(fit_model(process_track))
+        if (!(inherits(tmp,"try-error"))) 
+            break
+    }
+    return(tmp)
+}
+
+mbest_C = fit_model_noerror(process_track_C)
+mbest_A = fit_model_noerror(process_track_A)
+mbest_CA = fit_model_noerror(process_track_CA)
+mbest_R = fit_model_noerror(process_track_R)
+mbest_S = fit_model_noerror(process_track_S)
+```
+
+Conduct model inference of 2-state HMM
+```{r, include=FALSE, warning=FALSE}
+inference =function(mbest, animals) {
+    mbest
+    
+    # Calculate the confidence interval
+    CI(mbest)
+    
+    # Plot the model
+    plot(mbest, animals=animals, plotCI=TRUE, ask=F)
+    
+    # Visualize the results of viterbi and stateProbs
+    plotStates(mbest,animals=animals, ask=F)
+} 
+
+inference(mbest_A, animals = c('3'))
+```
+
+Decode the model using two algorithms
+```{r, include=FALSE, warning=FALSE}
+decode = function(mbest) {
+    # State decoding using Viterbi algorithm 
+    states <- viterbi(mbest)
+    #### states[1:25]
+    
+    # State decoding using State probabilities
+    sp <- stateProbs(mbest)
+    #### head(sp)
+    return(list(states, sp))
+}
+
+decode_A = decode(mbest_A)
+decode_C = decode(mbest_C)
+decode_CA = decode(mbest_CA)
+decode_R = decode(mbest_R)
+decode_S = decode(mbest_S)
+```
+
+
+Tune the initial parameters for three-state HMM without covariate and train multiple models
+```{r, include=FALSE, warning=FALSE}
+# Fit the niter models in parallel
+fit_model_3 = function(process_track) {
+    # https://cran.csiro.au/web/packages/moveHMM/vignettes/moveHMM-starting-values.pdf
+    # Create cluster of size ncores
+    ncores <- detectCores() - 1
+    cl <- makeCluster(getOption("cl.cores", ncores))
+    # Export objects needed in parallelised function to cluster
+    clusterExport(cl, list(deparse(substitute(process_track)), "fitHMM"))
+    
+    # Number of tries with different starting values
+    niter <- 10
+    
+    # Create list of starting values
+    allPar0 <- lapply(as.list(1:niter), function(x) {
+            # Step length mean
+            stepMean0 <- runif(3,
+                    min = c(0, 0.01, 0.02),
+                    max = c(0.02, 0.03, 0.04))
+            # Step length standard deviation
+            stepSD0 <- runif(3,
+                    min = c(0, 0.01, 0.02),
+                    max = c(0.02, 0.03, 0.04))
+            # Step length zero proportion
+            zeroMass0 <- runif(3,
+                    min = c(0, 0.005, 0.005),
+                    max = c(0.02, 0.03, 0.04))
+            # Turning angle mean
+            angleMean0 <- rep(0, 3)
+            # Turning angle concentration
+            angleCon0 <- runif(3,
+                    min = c(0, 0.2, 0.3),
+                    max = c(0.8, 4, 5))
+            # Return vectors of starting values
+            stepPar0 <- c(stepMean0, stepSD0, zeroMass0)
+            anglePar0 <- c(angleMean0, angleCon0)
+            return(list(step = stepPar0, angle = anglePar0))
+    })
+    
+    # Fit the niter models in parallel
+    allm_parallel_3 <- parLapply(cl = cl, X = allPar0, fun = function(par0) {
+            m <- fitHMM(data = process_track, nbStates = 3, stepPar0 = par0$step,
+            anglePar0 = par0$angle)
+            return(m)
+    })
+    
+    # Index of best fitting model (smallest negative log-likelihood)
+    whichbest_3 <- which.min(lapply(allm_parallel_3, function(x) x$mod$minimum))
+    # Best fitting model
+    mbest_3 <- allm_parallel_3[[whichbest_3]]
+}
+
+# Here we can still apply try-catch combo here to avoid unconvergence and error, but as the ratio is very low, the error checking machanism is not used.
+
+mbest_C_3 = fit_model_3(process_track_C)
+mbest_A_3 = fit_model_3(process_track_A)
+mbest_CA_3 = fit_model_3(process_track_CA)
+mbest_R_3 = fit_model_3(process_track_R)
+mbest_S_3 = fit_model_3(process_track_S)
+```
+
+Conduct model inference of 3-state HMM
+```{r, include=FALSE, warning=FALSE}
+inference(mbest_A_3, animals = c('3'))
+```
+
+Decode the model using two algorithms
+```{r, include=FALSE, warning=FALSE}
+decode_A_3 = decode(mbest_A_3)
+decode_C_3 = decode(mbest_C_3)
+decode_CA_3 = decode(mbest_CA_3)
+decode_R_3 = decode(mbest_R_3)
+decode_S_3 = decode(mbest_S_3)
+```
+
+Model selection with AIC
+```{r, include=FALSE, warning=FALSE}
+AIC(mbest_C, mbest_C_3)
+AIC(mbest_A, mbest_A_3)
+AIC(mbest_CA, mbest_CA_3)
+AIC(mbest_R, mbest_R_3)
+AIC(mbest_S, mbest_S_3)
+```
+
+Model checking
+```{r, include=FALSE, warning=FALSE}
+check = function(mbest) {
+    # compute the pseudo-residuals
+    pr <- pseudoRes(mbest)
+    # time series, qq-plots, and ACF of the pseudo-residuals
+    plotPR(mbest)
+}
+
+check(mbest_A)
+check(mbest_A_3)
+```
+
+Model Validation using confusion matrix
+```{r, include=FALSE, warning=FALSE}
+# Define some function for model validation
+confusion_1 = function(state, record, mbest) {
+    order = c("1", "2")[order(mbest$mle$stepPar[1,])]
+    
+    trans <- list(
+        c("AS", "TS"),
+        c("DF", "END", "KP", "REST")
+    )
+    names(trans) <- order
+    
+    for (i in 1:length(trans)) record$CONTBEH[record$CONTBEH%in%trans[[i]]] <- names(trans)[i]
+    
+    return(list(confusionMatrix(factor(state), factor(as.numeric(record$CONTBEH), levels=c(1, 2))),
+                CCorDistance(state, as.numeric(record$CONTBEH))))
+}
+
+confusion_2 = function(state, record, mbest) {
+    order = c("1", "2")[order(mbest$mle$stepPar[1,])]
+    
+    trans <- list(
+        c("AS"),
+        c("DF", "TS", "END", "KP", "REST")
+    )
+    names(trans) <- order
+
+    for (i in 1:length(trans)) record$CONTBEH[record$CONTBEH%in%trans[[i]]] <- names(trans)[i]
+    
+    return(list(confusionMatrix(factor(state), factor(as.numeric(record$CONTBEH), levels=c(1, 2))),
+                CCorDistance(state, as.numeric(record$CONTBEH))))
+}
+
+confusion_3 = function(state, record, mbest) {
+    order = c("1", "2", "3")[order(mbest$mle$stepPar[1,])]
+    trans <- list(
+        c("AS"),
+        c("TS"),
+        c( "KP","DF","END","REST")
+    )
+    names(trans) <- order
+
+    for (i in 1:length(trans)) record$CONTBEH[record$CONTBEH%in%trans[[i]]] <- names(trans)[i]
+    
+    return(list(confusionMatrix(factor(state), factor(as.numeric(record$CONTBEH), levels=c(1, 2, 3))),
+                CCorDistance(state, as.numeric(record$CONTBEH))))
+}
+```
+
+```{r, include=FALSE, warning=FALSE}
+
+confusion_1(decode_A[[1]], track_A, mbest_A)
+confusion_2(decode_A[[1]], track_A, mbest_A)
+confusion_3(decode_A_3[[1]], track_A, mbest_A_3)
+
+confusion_1(decode_C[[1]], track_C, mbest_C)
+confusion_2(decode_C[[1]], track_C, mbest_C)
+confusion_3(decode_C_3[[1]], track_C, mbest_C_3)
+
+confusion_1(decode_CA[[1]], track_CA, mbest_CA)
+confusion_2(decode_CA[[1]], track_CA, mbest_CA)
+confusion_3(decode_CA_3[[1]], track_CA, mbest_CA_3)
+
+confusion_1(decode_R[[1]], track_R, mbest_R)
+confusion_2(decode_R[[1]], track_R, mbest_R)
+confusion_3(decode_R_3[[1]], track_R, mbest_R_3)
+
+confusion_1(decode_S[[1]], track_S, mbest_S)
+confusion_2(decode_S[[1]], track_S, mbest_S)
+confusion_3(decode_S_3[[1]], track_S, mbest_S_3)
+
+
+```
